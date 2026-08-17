@@ -5,8 +5,11 @@
 """
 
 import os
+import time
+from datetime import datetime, timedelta
 import streamlit as st
 import gspread
+from gspread.exceptions import APIError
 from google.oauth2.service_account import Credentials
 import pandas as pd
 
@@ -200,9 +203,21 @@ def open_spreadsheet():
     return client.open_by_key(sid)
 
 
+def api_call_with_retry(func, *args, retries=4, **kwargs):
+    """遇到 API 速率限制時自動等待重試"""
+    for attempt in range(retries):
+        try:
+            return func(*args, **kwargs)
+        except APIError as e:
+            if attempt == retries - 1:
+                raise
+            wait = 2 ** attempt  # 1s, 2s, 4s, 8s
+            time.sleep(wait)
+
+
 def load_players() -> pd.DataFrame:
     ws = open_spreadsheet().worksheet(SHEET_PLAYERS)
-    records = ws.get_all_records()
+    records = api_call_with_retry(ws.get_all_records)
     if not records:
         return pd.DataFrame(columns=["號碼", "姓名", "等級分"])
     df = pd.DataFrame(records)
@@ -224,7 +239,7 @@ def update_match(winner_num: int, loser_num: int):
     players_ws = ss.worksheet(SHEET_PLAYERS)
     history_ws = ss.worksheet(SHEET_HISTORY)
 
-    records = players_ws.get_all_records()
+    records = api_call_with_retry(players_ws.get_all_records)
     df = pd.DataFrame(records)
     df["號碼"] = df["號碼"].astype(int)
     df["等級分"] = df["等級分"].astype(int)
@@ -240,9 +255,10 @@ def update_match(winner_num: int, loser_num: int):
     r_w, r_l = int(w["等級分"]), int(l["等級分"])
     new_r_w, new_r_l, delta = calculate_elo(r_w, r_l)
 
-    history_ws.append_row([winner_num, str(w["姓名"]), r_w, loser_num, str(l["姓名"]), r_l])
-    players_ws.update_cell(w_rows.index[0] + 2, 3, new_r_w)
-    players_ws.update_cell(l_rows.index[0] + 2, 3, new_r_l)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    api_call_with_retry(history_ws.append_row, [winner_num, str(w["姓名"]), r_w, loser_num, str(l["姓名"]), r_l, timestamp])
+    api_call_with_retry(players_ws.update_cell, w_rows.index[0] + 2, 3, new_r_w)
+    api_call_with_retry(players_ws.update_cell, l_rows.index[0] + 2, 3, new_r_l)
 
     return True, (
         f"✅ **{w['姓名']}** {r_w} → **{new_r_w}** (+{delta})　｜　"
@@ -256,7 +272,7 @@ def undo_last():
     players_ws = ss.worksheet(SHEET_PLAYERS)
     history_ws = ss.worksheet(SHEET_HISTORY)
 
-    all_vals = history_ws.get_all_values()
+    all_vals = api_call_with_retry(history_ws.get_all_values)
     if len(all_vals) < 2:
         return False, "沒有可以復原的紀錄"
 
@@ -267,7 +283,7 @@ def undo_last():
     except (IndexError, ValueError):
         return False, "History 資料格式有誤"
 
-    records = players_ws.get_all_records()
+    records = api_call_with_retry(players_ws.get_all_records)
     df = pd.DataFrame(records)
     df["號碼"] = df["號碼"].astype(int)
 
@@ -276,11 +292,97 @@ def undo_last():
     if w_rows.empty or l_rows.empty:
         return False, "找不到選手資料"
 
-    players_ws.update_cell(w_rows.index[0] + 2, 3, old_r_w)
-    players_ws.update_cell(l_rows.index[0] + 2, 3, old_r_l)
-    history_ws.delete_rows(len(all_vals))
+    api_call_with_retry(players_ws.update_cell, w_rows.index[0] + 2, 3, old_r_w)
+    api_call_with_retry(players_ws.update_cell, l_rows.index[0] + 2, 3, old_r_l)
+    api_call_with_retry(history_ws.delete_rows, len(all_vals))
 
     return True, f"↩️ 已復原：**{w_name}** → {old_r_w}　｜　**{l_name}** → {old_r_l}"
+
+
+# ─── 歷史資料與近況分析 ──────────────────────────────────────────────────────
+def load_history() -> pd.DataFrame:
+    ws = open_spreadsheet().worksheet(SHEET_HISTORY)
+    all_vals = api_call_with_retry(ws.get_all_values)
+    if len(all_vals) < 2:
+        return pd.DataFrame()
+    rows = []
+    for row in all_vals[1:]:
+        if len(row) >= 6 and row[0]:
+            try:
+                rows.append({
+                    "勝者號碼": int(row[0]),
+                    "勝者姓名": row[1],
+                    "勝者舊分": int(row[2]),
+                    "敗者號碼": int(row[3]),
+                    "敗者姓名": row[4],
+                    "敗者舊分": int(row[5]),
+                    "時間": row[6] if len(row) > 6 and row[6] else "—",
+                })
+            except (ValueError, IndexError):
+                continue
+    return pd.DataFrame(rows)
+
+
+def get_player_matches(player_num: int, df_hist: pd.DataFrame) -> pd.DataFrame:
+    """取得某選手所有對局，並計算分數變化"""
+    records = []
+    for _, row in df_hist.iterrows():
+        if row["勝者號碼"] == player_num:
+            r_self, r_opp = row["勝者舊分"], row["敗者舊分"]
+            opp_name, result = row["敗者姓名"], "勝"
+        elif row["敗者號碼"] == player_num:
+            r_self, r_opp = row["敗者舊分"], row["勝者舊分"]
+            opp_name, result = row["勝者姓名"], "敗"
+        else:
+            continue
+        e_w = 1 / (1 + 10 ** ((r_opp - r_self) / 400))
+        delta = round(16 * (1 - e_w))
+        change = delta if result == "勝" else -delta
+        records.append({
+            "時間": row["時間"],
+            "結果": result,
+            "對手": opp_name,
+            "對手當時分": r_opp,
+            "分數變化": change,
+        })
+    return pd.DataFrame(records)
+
+
+def check_circuit_breaker(matches: pd.DataFrame):
+    """檢查三個熔斷指標，回傳警報列表"""
+    alerts = []
+    if matches.empty:
+        return alerts
+
+    # 指標1：單場爆冷失分 > 25
+    worst = matches["分數變化"].min()
+    if worst <= -25:
+        alerts.append(("🔴", "爆冷熔斷", f"曾單場失分 {worst} 分（閾值 −25）"))
+
+    # 指標2：近7天累計失分 > 40（有時間戳才算）
+    timed = matches[matches["時間"] != "—"].copy()
+    if not timed.empty:
+        cutoff = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        recent7 = timed[timed["時間"] >= cutoff]
+        net7 = recent7["分數變化"].sum()
+        if net7 <= -40:
+            alerts.append(("🔴", "週度失血", f"近 7 天累計失分 {net7} 分（閾值 −40）"))
+        elif net7 <= -20:
+            alerts.append(("🟡", "週度預警", f"近 7 天累計失分 {net7} 分"))
+
+    # 指標3：目前連敗數
+    streak = 0
+    for r in reversed(matches["結果"].tolist()):
+        if r == "敗":
+            streak += 1
+        else:
+            break
+    if streak >= 3:
+        alerts.append(("🔴", "連敗熔斷", f"目前 {streak} 連敗"))
+    elif streak == 2:
+        alerts.append(("🟡", "連敗預警", f"目前 {streak} 連敗，需留意心態"))
+
+    return alerts
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -412,6 +514,7 @@ with col_right:
                 else:
                     ok, msg = update_match(parse_num(ws), parse_num(ls))
                     (ok_msgs if ok else err_msgs).append(f"{label}：{msg}")
+                time.sleep(1.2)  # 避免觸發 Google API 速率限制
                 prog.progress((i + 1) / len(valid))
             prog.empty()
             if ok_msgs:
@@ -487,7 +590,7 @@ def build_table(df: pd.DataFrame, show_rank: bool = False) -> str:
 if df_all.empty:
     st.info("📭 尚無選手資料")
 else:
-    tab_num, tab_rank, tab_new = st.tabs(["🔢 號碼排序", "🏅 英雄榜排名", "🌟 新銳隊英雄榜"])
+    tab_num, tab_rank, tab_new, tab_stats = st.tabs(["🔢 號碼排序", "🏅 英雄榜排名", "🌟 新銳隊英雄榜", "📊 選手近況"])
 
     with tab_num:
         df_n = df_all.sort_values("號碼").reset_index(drop=True)
@@ -508,3 +611,71 @@ else:
         df_new.insert(0, "排名", range(1, len(df_new) + 1))
         st.caption("新銳隊：10–17 號選手，依等級分排名")
         st.html(build_table(df_new, show_rank=True))
+
+    with tab_stats:
+        st.markdown("#### 📊 選手近況與熔斷分析")
+        stats_sel = st.selectbox("選擇選手", player_opts, key="stats_player")
+
+        if st.button("🔍 分析", key="btn_stats"):
+            player_num  = parse_num(stats_sel)
+            player_name = stats_sel.split(" - ")[1]
+
+            with st.spinner("讀取對局紀錄…"):
+                df_hist = load_history()
+
+            if df_hist.empty:
+                st.info("尚無對局紀錄")
+            else:
+                matches = get_player_matches(player_num, df_hist)
+                if matches.empty:
+                    st.info(f"{player_name} 尚無對局紀錄")
+                else:
+                    # ── 數據摘要 ──
+                    total = len(matches)
+                    wins  = (matches["結果"] == "勝").sum()
+                    net   = matches["分數變化"].sum()
+
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("總對局", total)
+                    c2.metric("勝", wins)
+                    c3.metric("敗", total - wins)
+                    c4.metric("累計得失分", f"{'+' if net >= 0 else ''}{net}")
+
+                    # ── 熔斷警報 ──
+                    alerts = check_circuit_breaker(matches)
+                    st.markdown("##### 熔斷指標")
+                    if alerts:
+                        for icon, title, detail in alerts:
+                            if icon == "🔴":
+                                st.error(f"{icon} **{title}**　{detail}")
+                            else:
+                                st.warning(f"{icon} **{title}**　{detail}")
+                    else:
+                        st.success("✅ 目前無熔斷警報，狀態正常")
+
+                    # ── 近期對局明細（最新10筆） ──
+                    st.markdown("##### 近期對局（最新 10 筆）")
+                    recent = matches.tail(10).iloc[::-1].reset_index(drop=True)
+                    rows_html = ""
+                    for _, r in recent.iterrows():
+                        color = "#16a34a" if r["結果"] == "勝" else "#dc2626"
+                        sign  = "+" if r["分數變化"] > 0 else ""
+                        rows_html += (
+                            "<tr>"
+                            f'<td style="text-align:center">{r["時間"]}</td>'
+                            f'<td style="text-align:center;font-weight:700;color:{color}">{r["結果"]}</td>'
+                            f'<td style="text-align:left">{r["對手"]}</td>'
+                            f'<td style="text-align:center;color:#555">{r["對手當時分"]}</td>'
+                            f'<td style="text-align:center;font-weight:700;color:{color}">{sign}{r["分數變化"]}</td>'
+                            "</tr>"
+                        )
+                    st.html(
+                        TABLE_CSS
+                        + '<div class="elo-table-wrap"><table class="elo-table"><thead><tr>'
+                        + '<th style="text-align:center;width:22%">時間</th>'
+                        + '<th style="text-align:center;width:10%">勝敗</th>'
+                        + '<th style="text-align:left;width:33%">對手</th>'
+                        + '<th style="text-align:center;width:20%">對手當時分</th>'
+                        + '<th style="text-align:center;width:15%">分數變化</th>'
+                        + "</tr></thead><tbody>" + rows_html + "</tbody></table></div>"
+                    )
