@@ -499,8 +499,9 @@ else:
         st.html(build_table(df_r, show_rank=True))
 
     with tab_new:
+        NEW_TEAM = [10, 11, 12, 13, 14, 15, 16, 17, 43]
         df_new = (
-            df_all[df_all["號碼"].between(10, 17)]
+            df_all[df_all["號碼"].isin(NEW_TEAM)]
             .sort_values("等級分", ascending=False)
             .reset_index(drop=True)
         )
