@@ -76,7 +76,7 @@ def get_ws(name, headers):
     try:
         return ss.worksheet(name)
     except gspread.WorksheetNotFound:
-        ws = ss.add_worksheet(title=name, rows=1000, cols=len(headers))
+        ws = ss.add_worksheet(title=name, rows=1000, cols=26)
         api_retry(ws.append_row, headers)
         return ws
 
