@@ -81,10 +81,19 @@ def get_ws(name, headers):
         return ws
 
 def ensure_col(ws, col_name):
-    """在工作表標題列加入缺少的欄位（只執行一次，之後自動跳過）"""
+    """在工作表標題列加入缺少的欄位；若欄數不足先 resize 再寫入。"""
     hdrs = api_retry(ws.row_values, 1)
     if col_name not in hdrs:
-        api_retry(ws.update_cell, 1, len(hdrs) + 1, col_name)
+        target = len(hdrs) + 1
+        try:
+            # 先擴充工作表欄數，避免 update_cell 超界
+            api_retry(ws.resize, rows=1000, cols=max(target, 26))
+        except Exception:
+            pass
+        try:
+            api_retry(ws.update_cell, 1, target, col_name)
+        except Exception:
+            pass  # 若仍失敗則靜默跳過，birth_year 欄不會出現在舊資料中
 
 # ─── 資料讀取 ─────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=30)
