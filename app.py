@@ -590,7 +590,7 @@ def build_table(df: pd.DataFrame, show_rank: bool = False) -> str:
 if df_all.empty:
     st.info("📭 尚無選手資料")
 else:
-    tab_num, tab_rank, tab_new, tab_stats = st.tabs(["🔢 號碼排序", "🏅 英雄榜排名", "🌟 新銳隊英雄榜", "📊 選手近況"])
+    tab_num, tab_rank, tab_elite, tab_new, tab_stats = st.tabs(["🔢 號碼排序", "🏅 英雄榜排名", "🥇 菁英隊英雄榜", "🌟 新銳隊英雄榜", "📊 選手近況"])
 
     with tab_num:
         df_n = df_all.sort_values("號碼").reset_index(drop=True)
@@ -600,6 +600,17 @@ else:
         df_r = df_all.sort_values("等級分", ascending=False).reset_index(drop=True)
         df_r.insert(0, "排名", range(1, len(df_r) + 1))
         st.html(build_table(df_r, show_rank=True))
+
+    with tab_elite:
+        ELITE_TEAM = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        df_elite = (
+            df_all[df_all["號碼"].isin(ELITE_TEAM)]
+            .sort_values("等級分", ascending=False)
+            .reset_index(drop=True)
+        )
+        df_elite.insert(0, "排名", range(1, len(df_elite) + 1))
+        st.caption("菁英隊：1–9 號選手，依等級分排名")
+        st.html(build_table(df_elite, show_rank=True))
 
     with tab_new:
         NEW_TEAM = [10, 11, 12, 13, 14, 15, 16, 17, 43]
